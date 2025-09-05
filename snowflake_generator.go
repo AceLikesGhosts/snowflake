@@ -14,7 +14,6 @@ var (
 )
 
 const (
-	// 41 instead of 42 due to using a signed int
 	snowflakeTimestampBits = 41
 	snowflakeNodeIdBits    = 10
 	snowflakeSequenceBits  = 12
@@ -24,80 +23,79 @@ const (
 	snowflakeSequenceMask   = (1 << snowflakeSequenceBits) - 1
 )
 
-type SnowflakeGenerator struct {
-	// timsetamp offset
-	tsepoch int64
-	// node id
-	nid int64
-	// last timestamp
-	lts int64
-	// start time
-	st time.Time
-}
-
 var (
-	ErrInvalidNodeId           error = errors.New("node is exceeds the maximum of 10 bits")
-	ErrGenerationClockRollback error = errors.New("clock went backwards")
+	ErrInvalidNodeId           = errors.New("node ID exceeds maximum of 10 bits")
+	ErrGenerationClockRollback = errors.New("clock went backwards")
 )
 
+type SnowflakeGenerator struct {
+	tsepoch    int64
+	shiftedNid int64
+
+	// start time
+	st time.Time
+	// atomic int64, last timestamp used
+	lts int64
+	// atomic int64, seq number
+	seq int64
+}
+
 func NewGenerator(nodeId, timestampEpoch int64) (*SnowflakeGenerator, error) {
-	if nodeId >= (1<<snowflakeNodeIdBits)-1 {
+	if nodeId >= (1 << snowflakeNodeIdBits) {
 		return nil, ErrInvalidNodeId
 	}
 
 	return &SnowflakeGenerator{
-		st:      time.Now(),
-		nid:     nodeId,
-		tsepoch: timestampEpoch,
+		tsepoch:    timestampEpoch,
+		shiftedNid: nodeId << snowflakeNodeIdShift,
+		st:         time.Now(),
+		seq:        0,
+		lts:        0,
 	}, nil
 }
 
+// MustGenerate panics on error
 func (s *SnowflakeGenerator) MustGenerate() Snowflake {
-	snowflake, err := s.Generate()
+	id, err := s.Generate()
 	if err != nil {
 		panic(err)
 	}
-
-	return snowflake
+	return id
 }
 
+// Generates a Snowflake.
 func (s *SnowflakeGenerator) Generate() (Snowflake, error) {
 	for {
-		elapsed := time.Since(s.st).Milliseconds()
-		now := elapsed
+		now := time.Now().UnixMilli()
+		relativeTs := now - s.tsepoch
 
-		old := atomic.LoadInt64(&s.lts)
-		oldTs := old >> snowflakeSequenceBits
-		oldSeq := old & snowflakeSequenceMask
+		lastTs := atomic.LoadInt64(&s.lts)
+		seq := atomic.LoadInt64(&s.seq)
 
-		var newTs, newSeq int64
+		if relativeTs < lastTs {
+			return 0, ErrGenerationClockRollback
+		}
 
-		switch {
-		case now > oldTs:
-			newTs = now
-			newSeq = 0
-
-		case now == oldTs:
-			if oldSeq == snowflakeSequenceMask {
-				// seq overflow, wait for next millisecond
+		if relativeTs == lastTs {
+			if seq == snowflakeSequenceMask {
 				time.Sleep(time.Millisecond)
 				continue
 			}
 
-			newTs = now
-			newSeq = oldSeq + 1
+			if !atomic.CompareAndSwapInt64(&s.seq, seq, seq+1) {
+				continue
+			}
 
-		case now < oldTs:
-			return Snowflake(0), ErrGenerationClockRollback
+			seq++
+		} else {
+			if !atomic.CompareAndSwapInt64(&s.lts, lastTs, relativeTs) {
+				continue
+			}
+			atomic.StoreInt64(&s.seq, 0)
+			seq = 0
 		}
 
-		packed := (newTs << snowflakeSequenceBits) | newSeq
-		if atomic.CompareAndSwapInt64(&s.lts, old, packed) {
-			finalTs := newTs + (s.tsepoch / 1e3)
-			return Snowflake(
-				(finalTs << snowflakeTimestampShift) |
-					(s.nid << snowflakeNodeIdShift) |
-					newSeq), nil
-		}
+		id := (relativeTs << snowflakeTimestampShift) | s.shiftedNid | seq
+		return Snowflake(id), nil
 	}
 }
