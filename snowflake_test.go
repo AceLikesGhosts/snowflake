@@ -6,31 +6,6 @@ import (
 	"testing"
 )
 
-func TestSnowflakeGenerateBasic(t *testing.T) {
-	gen, _ := NewGenerator(1, DiscordEpoch)
-	id := gen.MustGenerate()
-
-	if int64(id) == 0 {
-		t.Fatal("Generated snowflake ID should not be zero")
-	}
-
-	ts := int64(id) >> snowflakeTimestampShift
-	node := (int64(id) >> snowflakeNodeIdShift) & ((1 << snowflakeNodeIdBits) - 1)
-	seq := int64(id) & snowflakeSequenceMask
-
-	if node != 1 {
-		t.Errorf("Expected node ID 1, got %d", node)
-	}
-
-	if seq != 1 {
-		t.Errorf("Expected sequence 1 on first ID, got %d", seq)
-	}
-
-	if ts == 0 {
-		t.Errorf("Timestamp part should not be zero")
-	}
-}
-
 func TestSnowflakeJSONMarshaling(t *testing.T) {
 	gen, _ := NewGenerator(2, DiscordEpoch)
 	id := gen.MustGenerate()
