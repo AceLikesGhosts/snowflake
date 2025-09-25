@@ -31,13 +31,8 @@ var (
 type SnowflakeGenerator struct {
 	tsepoch    int64
 	shiftedNid int64
-
-	// start time
-	st time.Time
-	// atomic int64, last timestamp used
-	lts int64
-	// atomic int64, seq number
-	seq int64
+	// packed: (timestamp << 12) | sequence
+	state atomic.Int64
 }
 
 func NewGenerator(nodeId, timestampEpoch int64) (*SnowflakeGenerator, error) {
@@ -48,9 +43,6 @@ func NewGenerator(nodeId, timestampEpoch int64) (*SnowflakeGenerator, error) {
 	return &SnowflakeGenerator{
 		tsepoch:    timestampEpoch,
 		shiftedNid: nodeId << snowflakeNodeIdShift,
-		st:         time.Now(),
-		seq:        0,
-		lts:        0,
 	}, nil
 }
 
@@ -69,33 +61,44 @@ func (s *SnowflakeGenerator) Generate() (Snowflake, error) {
 		now := time.Now().UnixMilli()
 		relativeTs := now - s.tsepoch
 
-		lastTs := atomic.LoadInt64(&s.lts)
-		seq := atomic.LoadInt64(&s.seq)
+		prev := s.state.Load()
+		prevTs := prev >> snowflakeSequenceBits
+		prevSeq := prev & snowflakeSequenceMask
 
-		if relativeTs < lastTs {
-			return 0, ErrGenerationClockRollback
+		var nextTs, nextSeq int64
+
+		if relativeTs < prevTs {
+			deadline := time.Now().Add(15 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				now = time.Now().UnixMilli()
+				relativeTs = now - s.tsepoch
+				if relativeTs >= prevTs {
+					break
+				}
+				time.Sleep(1 * time.Millisecond)
+			}
+			if relativeTs < prevTs {
+				return 0, ErrGenerationClockRollback
+			}
 		}
 
-		if relativeTs == lastTs {
-			if seq == snowflakeSequenceMask {
+		if relativeTs == prevTs {
+			if prevSeq == snowflakeSequenceMask {
 				time.Sleep(time.Millisecond)
 				continue
 			}
-
-			if !atomic.CompareAndSwapInt64(&s.seq, seq, seq+1) {
-				continue
-			}
-
-			seq++
+			nextTs = prevTs
+			nextSeq = prevSeq + 1
 		} else {
-			if !atomic.CompareAndSwapInt64(&s.lts, lastTs, relativeTs) {
-				continue
-			}
-			atomic.StoreInt64(&s.seq, 0)
-			seq = 0
+			nextTs = relativeTs
+			nextSeq = 0
 		}
 
-		id := (relativeTs << snowflakeTimestampShift) | s.shiftedNid | seq
-		return Snowflake(id), nil
+		newState := (nextTs << snowflakeSequenceBits) | nextSeq
+
+		if s.state.CompareAndSwap(prev, newState) {
+			id := (nextTs << snowflakeTimestampShift) | s.shiftedNid | nextSeq
+			return Snowflake(id), nil
+		}
 	}
 }
